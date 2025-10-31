@@ -80,16 +80,94 @@ export class TransactionService {
       // If we reach here and we don't have a txHash, all attempts failed
       if (!txHash) throw lastError;
       
-      // Wait for transaction to be confirmed
-      const result = await aptosClient.waitForTransaction({
-        transactionHash: txHash,
-      });
+      // Wait for transaction to be confirmed.
+      // Some wallets return a hash before the fullnode has indexed it; poll with backoff when transaction_not_found.
+      const maxWaitAttempts = 30;
+      let waitAttempt = 0;
+      let waitResult: any = null;
+      let lastWaitError: any = null;
 
-      if (result.success) {
+      // Add initial delay before first attempt - transactions may need time to propagate
+      if (waitAttempt === 0) {
+        await new Promise((res) => setTimeout(res, 1000));
+      }
+
+      while (waitAttempt < maxWaitAttempts) {
+        try {
+          waitResult = await aptosClient.waitForTransaction({ transactionHash: txHash });
+          break;
+        } catch (err: any) {
+          lastWaitError = err;
+          
+          // Build comprehensive error message string (case-insensitive search)
+          const msg = (err && (
+            err.message || 
+            err.toString() || 
+            JSON.stringify(err) ||
+            String(err)
+          )) || '';
+          const msgLower = msg.toLowerCase();
+          
+          // Check for various forms of "transaction not found" errors:
+          // - String messages containing transaction_not_found (case-insensitive)
+          // - HTTP 404 status codes (Not Found)
+          // - Error messages containing "404" or "Not Found" (case-insensitive)
+          // - URL containing "/by_hash" (transaction lookup endpoint)
+          const isTransactionNotFound = 
+            msgLower.includes('transaction_not_found') || 
+            msgLower.includes('transaction not found') ||
+            msgLower.includes('not found') ||
+            msgLower.includes('404') ||
+            msgLower.includes('/transactions/by_hash') ||
+            err?.statusCode === 404 ||
+            err?.status === 404 ||
+            err?.response?.status === 404 ||
+            err?.response?.statusCode === 404 ||
+            err?.code === 404 ||
+            (err?.response?.data && typeof err.response.data === 'string' && err.response.data.toLowerCase().includes('not found'));
+          
+          // If the node hasn't indexed the transaction yet, wait and retry
+          if (isTransactionNotFound) {
+            const delay = Math.min(2000 * (waitAttempt + 1), 20000);
+            // Only log detailed info for first few attempts to reduce console noise
+            if (waitAttempt < 3) {
+              console.warn(`TransactionService: transaction not found yet (404), retrying in ${delay}ms (attempt ${waitAttempt + 1}/${maxWaitAttempts})`, { 
+                txHash, 
+                errorMsg: msg.substring(0, 200),
+                statusCode: err?.statusCode || err?.status || err?.response?.status,
+              });
+            }
+            // Update toast to show we're waiting for confirmation
+            toast.loading(`Waiting for transaction confirmation... (attempt ${waitAttempt + 1}/${maxWaitAttempts})`, { id: toastId });
+            // small sleep
+            await new Promise((res) => setTimeout(res, delay));
+            waitAttempt++;
+            continue;
+          }
+
+          // Other errors: break and propagate
+          console.error('TransactionService: error while waiting for transaction', {
+            error: err,
+            message: msg,
+            keys: Object.keys(err || {}),
+            statusCode: err?.statusCode || err?.status || err?.response?.status,
+            txHash,
+          });
+          throw err;
+        }
+      }
+
+      if (!waitResult) {
+        // All attempts exhausted
+        console.error('TransactionService: transaction not found after polling', lastWaitError);
+        throw lastWaitError || new Error('Transaction not found after waiting');
+      }
+
+      if (waitResult.success) {
         toast.success('Transaction successful!', { id: toastId });
         return true;
       } else {
-        throw new Error('Transaction failed: ' + JSON.stringify(result));
+        throw new Error('Transaction failed: ' + JSON.stringify(waitResult));
       }
     } catch (error: any) {
       console.error('Transaction error:', error);
